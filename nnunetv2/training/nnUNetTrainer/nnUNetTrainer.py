@@ -66,6 +66,8 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
+from nnunetv2.training.nnUNetTrainer.variants.loss.boundary_dataset_wrapper import BoundaryDatasetWrapper  # ? ton fichier B1
+
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -156,6 +158,19 @@ class nnUNetTrainer(object):
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
         # needed for predictions. We do sigmoid in case of (overlapping) regions
+        
+        
+        
+        # 1) Activer TF32 pour cuBLAS/cuDNN (matmul + conv)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # 2) Optionnel (PyTorch 2.x) : précision matmul 'high' autorise TF32 comme fallback rapide
+        try:
+            torch.set_float32_matmul_precision('high')  # 'highest'/'high'/'medium'
+        except AttributeError:
+            pass
+
 
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
@@ -608,16 +623,35 @@ class nnUNetTrainer(object):
                                        'splits.json or ignore if this is intentional.')
         return tr_keys, val_keys
 
-    def get_tr_and_val_datasets(self):
-        # create dataset split
-        tr_keys, val_keys = self.do_split()
+#    def get_tr_and_val_datasets(self):
+#        # create dataset split
+#        tr_keys, val_keys = self.do_split()
+#
+#        # load the datasets for training and validation. Note that we always draw random samples so we really don't
+#        # care about distributing training cases across GPUs.
+#        dataset_tr = self.dataset_class(self.preprocessed_dataset_folder, tr_keys,
+#                                        folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+#        dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
+#                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+#        return dataset_tr, dataset_val
 
-        # load the datasets for training and validation. Note that we always draw random samples so we really don't
-        # care about distributing training cases across GPUs.
-        dataset_tr = self.dataset_class(self.preprocessed_dataset_folder, tr_keys,
-                                        folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-        dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
-                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+
+    def get_tr_and_val_datasets(self):
+        tr_keys, val_keys = self.do_split()
+    
+        dataset_tr = self.dataset_class(
+            self.preprocessed_dataset_folder, tr_keys,
+            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
+        )
+        dataset_val = self.dataset_class(
+            self.preprocessed_dataset_folder, val_keys,
+            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
+        )
+    
+        # ?? ICI : on injecte les boundary bands pré-calculés dans chaque sample du train
+        boundary_root = "/scratch/nnUNet_raw/Dataset092_Prostate26/boundaryTr"  # ? ajuste le chemin
+        dataset_tr = BoundaryDatasetWrapper(dataset_tr, boundary_root)
+    
         return dataset_tr, dataset_val
 
     def get_dataloaders(self):
@@ -717,7 +751,7 @@ class nnUNetTrainer(object):
                 patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
                 p_rotation=0.2,
                 rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False  # , mode_seg='nearest'
+                bg_style_seg_sampling=False, keys_of_seg=('seg', 'boundary'), order_seg=('nearest', 'nearest')  # , mode_seg='nearest'
             )
         )
 
