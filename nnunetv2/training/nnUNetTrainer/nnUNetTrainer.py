@@ -68,6 +68,10 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 from nnunetv2.training.nnUNetTrainer.variants.loss.boundary_dataset_wrapper import BoundaryDatasetWrapper  # ? ton fichier B1
 
+from merge_boundary_into_seg import MergeBoundaryIntoSeg
+from split_boundary_from_seg import SplitBoundaryFromSeg
+# from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
+
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
