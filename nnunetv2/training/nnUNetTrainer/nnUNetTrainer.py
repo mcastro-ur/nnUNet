@@ -165,7 +165,7 @@ class nnUNetTrainer(object):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-        # 2) Optionnel (PyTorch 2.x) : prÈcision matmul 'high' autorise TF32 comme fallback rapide
+        # 2) Optionnel (PyTorch 2.x) : pr√©cision matmul 'high' autorise TF32 comme fallback rapide
         try:
             torch.set_float32_matmul_precision('high')  # 'highest'/'high'/'medium'
         except AttributeError:
@@ -648,7 +648,7 @@ class nnUNetTrainer(object):
             folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
         )
     
-        # ?? ICI : on injecte les boundary bands prÈ-calculÈs dans chaque sample du train
+        # ?? ICI : on injecte les boundary bands pr√©-calcul√©s dans chaque sample du train
         boundary_root = "/scratch/nnUNet_raw/Dataset092_Prostate26/boundaryTr"  # ? ajuste le chemin
         dataset_tr = BoundaryDatasetWrapper(dataset_tr, boundary_root)
     
@@ -746,14 +746,21 @@ class nnUNetTrainer(object):
         else:
             patch_size_spatial = patch_size
             ignore_axes = None
+        
+        # On ajoute NOTRE fusion AVANT SpatialTransform
+        transforms.append(MergeBoundaryIntoSeg(boundary_key='boundary', seg_key='seg'))
+
         transforms.append(
             SpatialTransform(
                 patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
                 p_rotation=0.2,
                 rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False, keys_of_seg=('seg', 'boundary'), order_seg=('nearest', 'nearest')  # , mode_seg='nearest'
+                bg_style_seg_sampling=False, mode_seg=('nearest'), border_mode_seg=('zeros'), center_deformation=True, padding_mode_image='zeros'  # , mode_seg='nearest'
             )
         )
+
+       # On SPLIT juste apr√®s SpatialTransform pour remettre seg/boundary comme attendu par la suite
+        transforms.append(SplitBoundaryFromSeg(boundary_key='boundary', seg_key='seg'))
 
         if do_dummy_2d_data_aug:
             transforms.append(Convert2DTo3DTransform())
