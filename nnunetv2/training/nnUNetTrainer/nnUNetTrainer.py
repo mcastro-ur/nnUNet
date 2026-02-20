@@ -68,8 +68,13 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 from nnunetv2.training.nnUNetTrainer.variants.loss.boundary_dataset_wrapper import BoundaryDatasetWrapper  # ? ton fichier B1
 
-from merge_boundary_into_seg import MergeBoundaryIntoSeg
-from split_boundary_from_seg import SplitBoundaryFromSeg
+#from nnunetv2.training.nnUNetTrainer.variants.loss.merge_boundary_into_seg import MergeBoundaryIntoSeg
+#from nnunetv2.training.nnUNetTrainer.variants.loss.split_boundary_from_seg import SplitBoundaryFromSeg
+
+from nnunetv2.training.nnUNetTrainer.variants.loss.MergeBoundaryIntoSegBGv2 import MergeBoundaryIntoSegBGv2
+from nnunetv2.training.nnUNetTrainer.variants.loss.SplitBoundaryFromSegBGv2 import SplitBoundaryFromSegBGv2
+
+
 # from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
 
 
@@ -752,20 +757,19 @@ class nnUNetTrainer(object):
             ignore_axes = None
         
         # On ajoute NOTRE fusion AVANT SpatialTransform
-        transforms.append(MergeBoundaryIntoSeg(boundary_key='boundary', seg_key='seg'))
+        #transforms.append(MergeBoundaryIntoSeg(boundary_key='boundary', seg_key='seg'))
+        transforms.append(MergeBoundaryIntoSegBGv2())
 
         transforms.append(
             SpatialTransform(
                 patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, p_elastic_deform=0,
                 p_rotation=0.2,
                 rotation=rotation_for_DA, p_scaling=0.2, scaling=(0.7, 1.4), p_synchronize_scaling_across_axes=1,
-                bg_style_seg_sampling=False, mode_seg=('nearest'), border_mode_seg=('zeros'), center_deformation=True, padding_mode_image='zeros'  # , mode_seg='nearest'
+                bg_style_seg_sampling=False, mode_seg='nearest', border_mode_seg='zeros', center_deformation=True, padding_mode_image='zeros'  # , mode_seg='nearest'
             )
         )
 
-       # On SPLIT juste après SpatialTransform pour remettre seg/boundary comme attendu par la suite
-        transforms.append(SplitBoundaryFromSeg(boundary_key='boundary', seg_key='seg'))
-
+       
         if do_dummy_2d_data_aug:
             transforms.append(Convert2DTo3DTransform())
 
@@ -884,6 +888,12 @@ class nnUNetTrainer(object):
 
         if deep_supervision_scales is not None:
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
+
+
+            
+            # On SPLIT juste après SpatialTransform pour remettre seg/boundary comme attendu par la suite
+        # transforms.append(SplitBoundaryFromSeg(boundary_key='boundary', seg_key='seg'))
+        transforms.append(SplitBoundaryFromSegBGv2())
 
         return ComposeTransforms(transforms)
 
