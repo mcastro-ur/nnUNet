@@ -155,6 +155,12 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
                 }
             if 'class_weights' in loss_cfg:
                 self._class_weights = {int(k): float(v) for k, v in loss_cfg['class_weights'].items()}
+
+        # Boundary weight schedule: warmup 50 epochs at 0, then linear ramp over 50 epochs
+        self._target_boundary_weight = self._loss_weights['boundary']
+        self._boundary_warmup_epochs = 50
+        self._boundary_ramp_epochs = 50
+        self._boundary_loss_core = None  # set in _build_loss
         
         # Lire training params
         self._custom_num_epochs = config.get('training', {}).get('num_epochs', 1500)
@@ -177,8 +183,14 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
         self.print_to_log_file(f"Custom oversample: {self.oversample_foreground_percent}")
         self.print_to_log_file(f"Custom epochs: {self.num_epochs}")
         self.print_to_log_file(f"Custom loss weights: {self._loss_weights}")
+        self.print_to_log_file(
+            f"Boundary weight schedule: warmup {self._boundary_warmup_epochs} epochs at 0, "
+            f"then linear ramp over {self._boundary_ramp_epochs} epochs to "
+            f"target={self._target_boundary_weight:.6f}"
+        )
         if self._class_weights:
             self.print_to_log_file(f"Custom class weights: {self._class_weights}")
+            self.print_to_log_file(f"Class weights applied to boundary loss: True")
     
     def configure_optimizers(self):
         """Utiliser weight_decay du JSON"""
@@ -198,12 +210,15 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
         import numpy as np
         
         loss_core = BoundaryDiceCELoss(
-            weight_boundary=self._loss_weights['boundary'],
+            weight_boundary=0.0,  # starts at 0; schedule applied via on_epoch_start
             weight_dice=self._loss_weights['dice'],
             weight_ce=self._loss_weights['ce'],
             class_weights=self._class_weights,
             ddp=self.is_ddp
         )
+        
+        # Keep reference so we can update weight_boundary each epoch
+        self._boundary_loss_core = loss_core
         
         # DEBUG: vérifier quelle BoundaryLoss est réellement utilisée
         self.print_to_log_file(f"BoundaryLoss class: {loss_core.boundary_loss.__class__}")
@@ -223,7 +238,30 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
             loss_core = DeepSupervisionWrapper(loss_core, weights)
         
         return loss_core
-    
+
+    def _compute_boundary_weight(self, epoch: int) -> float:
+        """Return the boundary weight for the given epoch according to the schedule."""
+        if epoch < self._boundary_warmup_epochs:
+            return 0.0
+        ramp_epoch = epoch - self._boundary_warmup_epochs
+        if ramp_epoch < self._boundary_ramp_epochs:
+            return self._target_boundary_weight * ramp_epoch / self._boundary_ramp_epochs
+        return self._target_boundary_weight
+
+    def on_epoch_start(self):
+        """Update boundary weight schedule and log on rank0."""
+        super().on_epoch_start()
+        if self._boundary_loss_core is not None:
+            w = self._compute_boundary_weight(self.current_epoch)
+            self._boundary_loss_core.weight_boundary = w
+            self.print_to_log_file(
+                f"[BoundarySchedule] epoch={self.current_epoch}  "
+                f"weight_boundary={w:.6f}  "
+                f"(target={self._target_boundary_weight:.6f}, "
+                f"warmup={self._boundary_warmup_epochs}, "
+                f"ramp={self._boundary_ramp_epochs})"
+            )
+
     def get_training_transforms(self, patch_size, rotation_for_DA, deep_supervision_scales,
                                mirror_axes, do_dummy_2d_data_aug, use_mask_for_norm=None,
                                is_cascaded=False, foreground_labels=None, regions=None,
