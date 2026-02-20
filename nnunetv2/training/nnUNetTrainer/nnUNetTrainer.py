@@ -658,8 +658,8 @@ class nnUNetTrainer(object):
         )
     
         # ?? ICI : on injecte les boundary bands pré-calculés dans chaque sample du train
-        boundary_root = "/scratch/nnUNet_raw/Dataset092_Prostate26/boundaryTr"  # ? ajuste le chemin
-        dataset_tr = BoundaryDatasetWrapper(dataset_tr, boundary_root)
+        #boundary_root = "/scratch/nnUNet_raw/Dataset092_Prostate26/boundaryTr"  # ? ajuste le chemin
+        #dataset_tr = BoundaryDatasetWrapper(dataset_tr, boundary_root)
     
         return dataset_tr, dataset_val
 
