@@ -4,7 +4,9 @@ Created on Wed Feb 11 14:33:57 2026
 
 @author: Miguel Castro USER
 """
-
+import os
+from torch._dynamo import OptimizedModule
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -99,7 +101,7 @@ class WeightedCrossEntropyLoss(torch.nn.Module):
 
 class BoundaryDiceCELoss(torch.nn.Module):
     """Loss combinée qui LIT les poids du JSON"""
-    def __init__(self, weight_boundary=0.3, weight_dice=0.5, weight_ce=0.2, 
+    def __init__(self, weight_boundary=0.1, weight_dice=0.5, weight_ce=0.4, 
                  class_weights=None, ddp=False):
         super().__init__()
         self.boundary_loss = BoundaryLoss(focus_small_classes=True, class_weights=class_weights)
@@ -202,6 +204,11 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
             class_weights=self._class_weights,
             ddp=self.is_ddp
         )
+        
+        # DEBUG: vérifier quelle BoundaryLoss est réellement utilisée
+        self.print_to_log_file(f"BoundaryLoss class: {loss_core.boundary_loss.__class__}")
+        self.print_to_log_file(f"BoundaryLoss forward source file: {loss_core.boundary_loss.forward.__code__.co_filename}")
+        self.print_to_log_file(f"BoundaryLoss forward firstlineno: {loss_core.boundary_loss.forward.__code__.co_firstlineno}")
         
         if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
@@ -371,3 +378,185 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
         
         return ComposeTransforms(transforms)
+        
+    def _get_network_for_state_dict(self):
+        """
+        Retourne le vrai réseau torch.nn.Module (gère DDP et torch.compile).
+        """
+        net = self.network
+        if isinstance(net, DDP):
+            net = net.module
+        if isinstance(net, OptimizedModule):
+            net = net._orig_mod
+        return net
+
+    def _load_pretrained_partial(self, ckpt_path: str):
+        """
+        Charge un checkpoint nnUNetv2 (checkpoint_best/final.pth) en copiant uniquement
+        les poids dont le nom ET la shape matchent.
+        """
+        if ckpt_path is None or not os.path.isfile(ckpt_path):
+            self.print_to_log_file(f"[PRETRAIN] checkpoint introuvable: {ckpt_path} -> skip")
+            return
+
+        self.print_to_log_file(f"[PRETRAIN] loading: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+
+        old_sd = ckpt.get("network_weights", None)
+        if old_sd is None:
+            raise RuntimeError(f"[PRETRAIN] checkpoint n'a pas la clé 'network_weights': {ckpt.keys()}")
+
+        net = self._get_network_for_state_dict()
+        new_sd = net.state_dict()
+
+        matched, skipped_missing, skipped_shape = 0, 0, 0
+
+        for k, v in old_sd.items():
+            kk = k
+            # compat si ancien ckpt a été sauvé en DDP avec "module."
+            if kk not in new_sd and kk.startswith("module."):
+                kk = kk[7:]
+
+            if kk not in new_sd:
+                skipped_missing += 1
+                continue
+            if new_sd[kk].shape != v.shape:
+                skipped_shape += 1
+                continue
+
+            new_sd[kk] = v
+            matched += 1
+
+        net.load_state_dict(new_sd, strict=True)
+        self.print_to_log_file(
+            f"[PRETRAIN] done. matched={matched}, skipped_missing={skipped_missing}, skipped_shape={skipped_shape}"
+        )
+    def initialize(self):
+        if self.was_initialized:
+            raise RuntimeError("initialize called twice")
+
+        # identique à nnUNetTrainer.initialize, mais avec injection du pretrain
+        self._set_batch_size_and_oversample()
+
+        from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+
+        self.num_input_channels = determine_num_input_channels(
+            self.plans_manager, self.configuration_manager, self.dataset_json
+        )
+
+        self.network = self.build_network_architecture(
+            self.configuration_manager.network_arch_class_name,
+            self.configuration_manager.network_arch_init_kwargs,
+            self.configuration_manager.network_arch_init_kwargs_req_import,
+            self.num_input_channels,
+            self.label_manager.num_segmentation_heads,
+            self.enable_deep_supervision
+        ).to(self.device)
+
+        # 1) chemin par défaut (ton ancien modèle)
+        #default_ckpt = "/scratch/nnUNet_results/Dataset072_Prostate/nnUNetTrainer_100epochs__nnUNetPlans__3d_fullres_new_plan/fold_all/checkpoint_best.pth"
+        default_ckpt = "/scratch/nnUNet_results/Dataset092_Prostate26/nnUNetTrainerV2_BoundaryDiceCE__nnUNetPlans__3d_fullres_custom_plan/fold_all//checkpoint_best.pth"
+        
+        # 2) override via variable d'environnement (recommandé)
+        ckpt_path = os.environ.get("NNUNETV2_PRETRAINED_CKPT", default_ckpt)
+
+        self._load_pretrained_partial(ckpt_path)
+
+        # compile après avoir chargé les poids
+        if self._do_i_compile():
+            self.print_to_log_file("Using torch.compile...")
+            self.network = torch.compile(self.network)
+
+        self.optimizer, self.lr_scheduler = self.configure_optimizers()
+
+        if self.is_ddp:
+            self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+            self.network = DDP(self.network, device_ids=[self.local_rank])
+
+        self.loss = self._build_loss()
+        self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+
+        self.was_initialized = True
+        
+    def validation_step(self, batch: dict) -> dict:
+        """
+        Même logique que nnUNetTrainer.validation_step, avec un log de debug:
+        ratio de voxels FG (label>0) prédits vs FG GT.
+        """
+        from nnunetv2.utilities.helpers import dummy_context
+        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
+        from torch import autocast
+        import numpy as np
+        import torch
+
+        data = batch['data']
+        target = batch['target']
+
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [i.to(self.device, non_blocking=True) for i in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data)
+            l = self.loss(output, target)
+
+        # On ne garde que la sortie la plus haute résolution si deep supervision
+        if self.enable_deep_supervision:
+            out_eval = output[0]
+            tgt_eval = target[0]
+        else:
+            out_eval = output
+            tgt_eval = target
+
+        # -------- DEBUG FG ratio (seulement rank 0, et pas à chaque batch) --------
+        if (not self.is_ddp) or (self.local_rank == 0):
+            if torch.rand(1).item() < 0.02:  # 2% des batches (évite spam)
+                pred_lbl = out_eval.argmax(1)  # (B, X, Y, Z) en softmax training
+                if tgt_eval.dim() == 5 and tgt_eval.shape[1] == 1:
+                    gt_lbl = tgt_eval[:, 0]
+                else:
+                    gt_lbl = tgt_eval
+
+                pred_fg = (pred_lbl > 0).float().mean().item()
+                gt_fg = (gt_lbl > 0).float().mean().item()
+                self.print_to_log_file(f"[DBG] fg_ratio pred={pred_fg:.6f} gt={gt_fg:.6f}")
+        # -----------------------------------------------------------------------
+
+        axes = [0] + list(range(2, out_eval.ndim))
+
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(out_eval) > 0.5).long()
+        else:
+            out_seg = out_eval.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(out_eval.shape, device=out_eval.device, dtype=torch.float16)
+            predicted_segmentation_onehot.scatter_(1, out_seg, 1)
+            del out_seg
+
+        if self.label_manager.has_ignore_label:
+            if not self.label_manager.has_regions:
+                mask = (tgt_eval != self.label_manager.ignore_label).float()
+                tgt_eval = tgt_eval.clone()
+                tgt_eval[tgt_eval == self.label_manager.ignore_label] = 0
+            else:
+                if tgt_eval.dtype == torch.bool:
+                    mask = ~tgt_eval[:, -1:]
+                else:
+                    mask = 1 - tgt_eval[:, -1:]
+                tgt_eval = tgt_eval[:, :-1]
+        else:
+            mask = None
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, tgt_eval, axes=axes, mask=mask)
+
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
