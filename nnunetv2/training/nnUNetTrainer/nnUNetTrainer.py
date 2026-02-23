@@ -65,6 +65,8 @@ from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+from nnunetv2.training.loss.merge_boundary_into_seg import MergeBoundaryIntoSeg
+from nnunetv2.training.loss.split_boundary_from_seg import SplitBoundaryFromSeg
 
 
 
