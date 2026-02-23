@@ -9,17 +9,17 @@ class MergeBoundaryIntoSeg:
     - Concatène le tout en une seule 'seg' multi-canaux : (1 + C_small, Z, Y, X)
     - Stocke le nombre de canaux ajoutés pour pouvoir "split" ensuite.
     """
-    def __init__(self, boundary_key='boundary', seg_key='seg', meta_key='_boundary_nch'):
+    def __init__(self, boundary_key='boundary', seg_key='segmentation', meta_key='_boundary_nch'):
         self.boundary_key = boundary_key
         self.seg_key = seg_key
         self.meta_key = meta_key
 
-    def __call__(self, sample: dict) -> dict:
-        if self.boundary_key not in sample:
-            return sample  # pas de boundary -> rien à faire
+    def __call__(self, **data_dict) -> dict:
+        if self.boundary_key not in data_dict:
+            return data_dict  # pas de boundary -> rien à faire
 
-        seg = sample[self.seg_key]
-        bnd = sample[self.boundary_key]  # (C_small, Z, Y, X)
+        seg = data_dict[self.seg_key]
+        bnd = data_dict[self.boundary_key]  # (C_small, Z, Y, X)
 
         # seg peut être (1, Z, Y, X) ou (Z, Y, X)
         if seg.ndim == 3:
@@ -30,11 +30,11 @@ class MergeBoundaryIntoSeg:
 
         # Concatène sur l'axe des canaux
         merged = np.concatenate([seg, bnd], axis=0)  # (1 + C_small, Z, Y, X)
-        sample[self.seg_key] = merged.astype(seg.dtype)
+        data_dict[self.seg_key] = merged.astype(seg.dtype)
 
         # Sauvegarder combien de canaux "boundary" on a fusionné
-        sample[self.meta_key] = bnd.shape[0]
+        data_dict[self.meta_key] = bnd.shape[0]
 
         # On peut supprimer la clé 'boundary' temporairement pour éviter confusions
-        del sample[self.boundary_key]
-        return sample
+        del data_dict[self.boundary_key]
+        return data_dict
