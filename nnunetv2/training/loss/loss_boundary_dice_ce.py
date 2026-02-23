@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Feb 11 14:33:57 2026
-
-@author: Miguel Castro USER
-"""
-
 # nnunetv2/training/loss/loss_boundary_dice_ce.py
 
 import torch
@@ -13,39 +6,84 @@ import torch.nn.functional as F
 
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss
+from nnunetv2.utilities.helpers import softmax_helper_dim1
+
 
 class BoundaryLoss(nn.Module):
     """
-    Boundary loss (Kervadec et al.) version simple pour segmentation multi-classe.
-    inputs: logits (B, C, ...), target: (B, ...), dist_maps: (B, C, ...)
-    dist_maps = signed distance map de chaque classe (GT)
+    Numerically stable boundary loss (simplified distance-weighted version).
+
+    Computes: mean over batch of sum_c(softmax(logits)_c * boundary_c)
+
+    boundary should be a float mask (B, C, ...) where high values indicate
+    boundary regions for each class. If not provided, falls back to a morphological
+    boundary derived from the one-hot target.
+
+    AMP note: the caller is responsible for ensuring this runs in FP32.
     """
-    def __init__(self):
+
+    def __init__(self, smooth: float = 1e-5):
         super().__init__()
+        self.smooth = smooth
 
-    def forward(self, logits, target, dist_maps):
-        # logits -> probas softmax
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        boundary: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Always run in FP32 to avoid NaN/overflow under AMP
+        logits = logits.float()
+
         probs = F.softmax(logits, dim=1)  # (B, C, ...)
-        # one-hot du GT
-        num_classes = probs.shape[1]
-        target_oh = F.one_hot(target.long(), num_classes=num_classes)  # (B, ..., C)
-        target_oh = target_oh.permute(0, -1, *range(1, target_oh.ndim-1)).float()  # (B, C, ...)
 
-        # boundary loss = somme_c ? P_c * D_c
-        # ici: moyenne sur batch + voxels
-        bl = (probs * dist_maps).sum(dim=(1, 2, 3, 4))  # pour 3D; adapte dim si 2D
-        return bl.mean()
+        if boundary is not None:
+            bnd = boundary.float()
+            # Clamp to avoid degenerate values
+            bnd = torch.clamp(bnd, 0.0, 1.0)
+        else:
+            bnd = self._boundary_from_target(target, num_classes=probs.shape[1])
+
+        # Weighted sum: (B,) then mean
+        loss = (probs * bnd).sum(dim=list(range(1, probs.ndim))).mean()
+        return loss
+
+    @staticmethod
+    def _boundary_from_target(target: torch.Tensor, num_classes: int) -> torch.Tensor:
+        """Morphological boundary mask derived from one-hot encoded target."""
+        target_long = target.long()
+        # Handle shape (B, 1, ...) or (B, ...)
+        target_squeezed = target_long[:, 0] if (target_long.ndim >= 2 and target_long.shape[1] == 1) else target_long
+        oh = F.one_hot(target_squeezed, num_classes=num_classes)  # (B, ..., C)
+        # Move class dim to position 1
+        perm = [0, oh.ndim - 1] + list(range(1, oh.ndim - 1))
+        oh = oh.permute(*perm).float()  # (B, C, ...)
+
+        # Morphological boundary via max-pool
+        kernel_size, padding = 3, 1
+        dilated = F.max_pool3d(oh, kernel_size=kernel_size, stride=1, padding=padding)
+        eroded = 1.0 - F.max_pool3d(1.0 - oh, kernel_size=kernel_size, stride=1, padding=padding)
+        boundary = torch.clamp(dilated - eroded, 0.0, 1.0)
+        return boundary
 
 
 class BoundaryDiceCELoss(nn.Module):
     """
-    0.3 * BoundaryLoss + 0.5 * DiceLoss + 0.2 * CE
+    Combined loss: w_dice * Dice + w_ce * CE + w_boundary * Boundary
+
+    The boundary weight can be set dynamically via the ``weight_boundary``
+    attribute (updated by the trainer each epoch for the warmup/ramp schedule).
     """
-    def __init__(self,
-                 weight_boundary=0.3,
-                 weight_dice=0.5,
-                 weight_ce=0.2,
-                 ignore_label=None):
+
+    def __init__(
+        self,
+        weight_boundary: float = 0.2,
+        weight_dice: float = 0.5,
+        weight_ce: float = 0.5,
+        ignore_label: int | None = None,
+        batch_dice: bool = True,
+        ddp: bool = False,
+    ):
         super().__init__()
         self.weight_boundary = weight_boundary
         self.weight_dice = weight_dice
@@ -53,27 +91,49 @@ class BoundaryDiceCELoss(nn.Module):
 
         self.boundary_loss = BoundaryLoss()
         self.dice_loss = MemoryEfficientSoftDiceLoss(
-            apply_nonlin=lambda x: F.softmax(x, dim=1),
-            smooth=1.0,
-            batch_dice=True,
-            do_bg=True
+            apply_nonlin=softmax_helper_dim1,
+            smooth=1e-5,
+            batch_dice=batch_dice,
+            do_bg=False,
+            ddp=ddp,
         )
-        self.ce_loss = RobustCrossEntropyLoss(ignore_label=ignore_label)
+        ce_kwargs: dict = {}
+        if ignore_label is not None:
+            ce_kwargs['ignore_index'] = ignore_label
+        self.ce_loss = RobustCrossEntropyLoss(**ce_kwargs)
+        self.ignore_label = ignore_label
 
-    def forward(self, logits, target, dist_maps):
-        """
-        logits: (B, C, ...)
-        target: (B, ...) labels entiers
-        dist_maps: (B, C, ...) distance map par classe
-        """
-        # Dice + CE utilisent (logits, target)
-        loss_dice = self.dice_loss(logits, target)
-        loss_ce = self.ce_loss(logits, target)
+    def forward(
+        self,
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        boundary: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.ignore_label is not None:
+            assert target.shape[1] == 1
+            mask = target != self.ignore_label
+            target_dice = torch.where(mask, target, torch.zeros_like(target))
+            num_fg = mask.sum()
+        else:
+            target_dice = target
+            mask = None
+            num_fg = None
 
-        # BoundaryLoss utilise aussi dist_maps
-        loss_boundary = self.boundary_loss(logits, target, dist_maps)
+        loss_dice = self.dice_loss(logits, target_dice, loss_mask=mask) if self.weight_dice != 0 else 0.0
+        loss_ce = (
+            self.ce_loss(logits, target[:, 0])
+            if self.weight_ce != 0 and (num_fg is None or num_fg > 0)
+            else 0.0
+        )
 
-        loss = (self.weight_boundary * loss_boundary +
-                self.weight_dice * loss_dice +
-                self.weight_ce * loss_ce)
-        return loss
+        if self.weight_boundary != 0:
+            loss_boundary = self.boundary_loss(logits, target, boundary)
+        else:
+            loss_boundary = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
+
+        return (
+            self.weight_dice * loss_dice
+            + self.weight_ce * loss_ce
+            + self.weight_boundary * loss_boundary
+        )
+

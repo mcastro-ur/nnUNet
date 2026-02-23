@@ -1,105 +1,195 @@
-# -*- coding: utf-8 -*-
+# nnunetv2/training/nnUNetTrainer/variants/loss/nnUNetTrainerV2_BoundaryDiceCE.py
 """
-Created on Wed Feb 11 14:33:57 2026
+nnUNetTrainerV2_BoundaryDiceCE
+==============================
+Trainer that adds a boundary-weighted loss on top of the standard Dice + CE loss.
 
-@author: Miguel Castro USER
+Loss = w_dice * Dice + w_ce * CE + w_boundary * BoundaryLoss
+
+Boundary weight schedule (applied per-epoch, updated in on_train_epoch_start):
+  - epochs 0..49  : w_boundary = 0   (warmup)
+  - epochs 50..99 : linear ramp 0 → w_boundary_max
+  - epochs >= 100 : w_boundary = w_boundary_max (constant)
+
+Design choices (see problem statement):
+  - torch.compile disabled (_do_i_compile returns False)
+  - BoundaryLoss computed in FP32 even under AMP (autocast disabled locally)
+  - NaN/Inf detection: crash only on NaN/Inf, log on rank-0 only
+  - Deep supervision: boundary loss applied only to the full-resolution output
+  - No modifications to plans/dataset
 """
 
-import torch
-import torch.nn.functional as F
 import numpy as np
-from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
-from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss
+import torch
+from torch import autocast
+
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
-from nnunetv2.utilities.helpers import softmax_helper_dim1
+from nnunetv2.training.loss.loss_boundary_dice_ce import BoundaryDiceCELoss
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from nnunetv2.utilities.helpers import dummy_context
 
-from boundary_dataset_wrapper import BoundaryDatasetWrapper
-from torch.cuda.amp import autocast, GradScaler
 
-class BoundaryLoss(torch.nn.Module):
-    # """Simple Boundary Loss (distance-weighted) pour nnU-Net"""
-    def __init__(self, smooth=1e-5):
+class _BoundaryDiceCEWithDS(torch.nn.Module):
+    """
+    Wraps BoundaryDiceCELoss so that it can be used with deep supervision.
+
+    For deep-supervised outputs (list/tuple), the boundary loss is applied
+    ONLY to the first (full-resolution) output; the remaining outputs use
+    the plain Dice + CE component of the loss (w_boundary forced to 0).
+
+    The ``weight_factors`` follow the same exponential-decay scheme as in the
+    standard nnUNet DeepSupervisionWrapper.
+    """
+
+    def __init__(self, loss_fn: BoundaryDiceCELoss, weight_factors: tuple):
         super().__init__()
-        self.smooth = smooth
+        self.loss_fn = loss_fn
+        self.weight_factors = weight_factors
 
-    def forward(self, logits, target, precomputed_boundary=None):
-        probs = F.softmax(logits, 1)
-        if precomputed_boundary is not None:
-            boundary = precomputed_boundary  # déjà au bon shape, mêmes classes
+    def forward(self, net_output, target, boundary=None):
+        if isinstance(net_output, (list, tuple)):
+            # Deep-supervised: multiple outputs + multiple targets
+            assert isinstance(target, (list, tuple))
+            total = torch.tensor(0.0, device=net_output[0].device, dtype=net_output[0].dtype)
+            for i, (out_i, tgt_i, w) in enumerate(zip(net_output, target, self.weight_factors)):
+                if w == 0:
+                    continue
+                # Boundary only for the full-res (first) output
+                bnd_i = boundary if i == 0 else None
+                total = total + w * self.loss_fn(out_i, tgt_i, bnd_i)
+            return total
         else:
-            boundary = self._get_boundary_mask_from_target(target)  # fallback
-        # (optionnel) nuller les grosses classes ici
-        return (probs * boundary).sum(dim=(1,2,3,4)).mean()    
+            return self.loss_fn(net_output, target, boundary)
 
-    def _get_boundary_mask(self, target_oh):
-        # Cr�e masque fronti�re simple (1 aux bordures, d�cro�t vers centre)
-        B, C, *spatial = target_oh.shape
-        
-        # Dilatation simple (kernel 3x3x3)
-        dilated = torch.nn.functional.max_pool3d(target_oh, kernel_size=3, stride=1, padding=1)
-        eroded = torch.nn.functional.max_pool3d(1 - target_oh, kernel_size=3, stride=1, padding=1)
-        
-        # Boundary = dilated - eroded (plus fort aux fronti�res)
-        boundary = dilated - eroded
-        boundary = torch.clamp(boundary, 0, 1)
-        
-        return boundary
-
-class BoundaryDiceCELoss(torch.nn.Module):
-    def __init__(self, weight_boundary=0.3, weight_dice=0.5, weight_ce=0.2):
-        super().__init__()
-        self.boundary_loss = BoundaryLoss()
-        self.dice_loss = MemoryEfficientSoftDiceLoss(smooth=1e-5, batch_dice=True, do_bg=True)
-        # ? SUPPRIME ignore_label !
-        self.ce_loss = RobustCrossEntropyLoss()  # ? SANS ignore_label
-        self.weight_boundary = weight_boundary
-        self.weight_dice = weight_dice
-        self.weight_ce = weight_ce
-    
-    def forward(self, logits, target):
-        l_dice = self.dice_loss(logits, target)
-        l_ce = self.ce_loss(logits, target)
-        l_boundary = self.boundary_loss(logits, target)
-        return self.weight_boundary * l_boundary + self.weight_dice * l_dice + self.weight_ce * l_ce
 
 class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
-    #"""Trainer avec Boundary+Dice+CE (0.3/0.5/0.2)"""
+    """
+    nnUNet trainer with Boundary + Dice + CE loss.
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.scaler = GradScaler()  # si pas déjà géré par le parent
+    Extra hyperparameters:
+      w_boundary_max : float  – peak boundary weight once fully ramped (default 0.2)
+      w_boundary_warmup_end : int  – epoch at which ramp starts (default 50)
+      w_boundary_ramp_end   : int  – epoch at which boundary weight reaches max (default 100)
+    """
 
+    # ------------------------------------------------------------------ #
+    # Class-level defaults (can be overridden in subclasses)              #
+    # ------------------------------------------------------------------ #
+    w_boundary_max: float = 0.2
+    w_boundary_warmup_end: int = 50   # epochs 0..(warmup_end-1) → w_boundary = 0
+    w_boundary_ramp_end: int = 100    # epochs warmup_end..(ramp_end-1) → linear ramp
+
+    # ------------------------------------------------------------------ #
+    # torch.compile disabled for this trainer                             #
+    # ------------------------------------------------------------------ #
+    def _do_i_compile(self) -> bool:
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Loss construction                                                   #
+    # ------------------------------------------------------------------ #
     def _build_loss(self):
-        loss_core = BoundaryDiceCELoss(
-            weight_boundary=0.3, weight_dice=0.5, weight_ce=0.2
+        ignore_label = self.label_manager.ignore_label
+
+        loss_fn = BoundaryDiceCELoss(
+            weight_boundary=0.0,                       # starts at 0; updated per epoch
+            weight_dice=0.5,
+            weight_ce=0.5,
+            ignore_label=ignore_label,
+            batch_dice=self.configuration_manager.batch_dice,
+            ddp=self.is_ddp,
         )
-        if self._do_i_compile():
-            loss_core = torch.compile(loss_core, mode="max-autotune")  # ou "reduce-overhead"
 
         if self.enable_deep_supervision:
-            weights = self._compute_ds_weights()  # tel que dans ton code
-            loss = DeepSupervisionWrapper(loss_core, weights)
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp:
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+            weights = weights / weights.sum()
+            loss = _BoundaryDiceCEWithDS(loss_fn, tuple(weights))
         else:
-            loss = loss_core
+            loss = loss_fn  # single output
+
+        # Keep a direct reference to loss_fn for weight updates
+        self._boundary_loss_fn = loss_fn
         return loss
-    
-   
-    def run_iteration(self, data, do_backprop=True):
-        data_input = data['data']
-        target = data['seg']
-        boundary = data.get('boundary', None)
 
-        with autocast(dtype=torch.float16):  # AMP ON
-            logits = self.network(data_input)
-            # >>> LIGNE IMPORTANTE : on passe boundary à la loss <<<
-            loss = self.loss(logits, target, boundary=boundary)
+    # ------------------------------------------------------------------ #
+    # Boundary weight schedule                                            #
+    # ------------------------------------------------------------------ #
+    def _get_boundary_weight(self, epoch: int) -> float:
+        if epoch < self.w_boundary_warmup_end:
+            return 0.0
+        if epoch >= self.w_boundary_ramp_end:
+            return self.w_boundary_max
+        ramp_len = self.w_boundary_ramp_end - self.w_boundary_warmup_end
+        if ramp_len <= 0:
+            return self.w_boundary_max
+        progress = (epoch - self.w_boundary_warmup_end) / ramp_len
+        return float(progress * self.w_boundary_max)
 
-        if do_backprop:
-            self.optimizer.zero_grad(set_to_none=True)
-            self.scaler.scale(loss).backward()
+    def on_train_epoch_start(self):
+        super().on_train_epoch_start()
+        w = self._get_boundary_weight(self.current_epoch)
+        self._boundary_loss_fn.weight_boundary = w
+        if self.local_rank == 0:
+            self.print_to_log_file(f"  [BoundaryDiceCE] w_boundary = {w:.4f}")
+
+    # ------------------------------------------------------------------ #
+    # Training step: pass boundary to loss, compute boundary in FP32     #
+    # ------------------------------------------------------------------ #
+    def train_step(self, batch: dict) -> dict:
+        data = batch['data']
+        target = batch['target']
+        # Optional pre-computed boundary masks (B, C_boundary, Z, Y, X)
+        boundary = batch.get('boundary', None)
+
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [t.to(self.device, non_blocking=True) for t in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+
+        if boundary is not None:
+            boundary = boundary.to(self.device, non_blocking=True)
+
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data)
+
+        # Compute loss in FP32 to avoid NaN/overflow in boundary term
+        with torch.autocast(self.device.type, enabled=False) if self.device.type == 'cuda' else dummy_context():
+            # Cast output back to float32 if needed
+            if isinstance(output, (list, tuple)):
+                output_fp32 = [o.float() for o in output]
+                target_fp32 = [t.float() if t.is_floating_point() else t for t in target] if isinstance(target, (list, tuple)) else target
+            else:
+                output_fp32 = output.float()
+                target_fp32 = target
+
+            l = self.loss(output_fp32, target_fp32, boundary)
+
+        # NaN/Inf check: crash only, log on rank-0 only
+        if not torch.isfinite(l):
+            if self.local_rank == 0:
+                self.print_to_log_file(
+                    f"WARNING: non-finite loss detected at epoch {self.current_epoch}: {l.item()}"
+                )
+            raise RuntimeError(f"Non-finite loss at epoch {self.current_epoch}: {l.item()}")
+
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
 
-        return loss.detach().cpu().numpy()
+        return {'loss': l.detach().cpu().numpy()}
+
