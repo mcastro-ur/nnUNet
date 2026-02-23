@@ -234,6 +234,11 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
         if self._class_weights:
             self.print_to_log_file(f"Custom class weights: {self._class_weights}")
     
+    def _do_i_compile(self):
+        # Disabled to reduce VRAM overhead / avoid OOM with 3D fullres + large patches
+        return False
+                
+            
     def configure_optimizers(self):
         """Utiliser weight_decay du JSON"""
         optimizer = torch.optim.SGD(
