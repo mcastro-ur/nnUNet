@@ -729,7 +729,7 @@ class nnUNetTrainer(object):
             ignore_axes = None
         
         # On ajoute NOTRE fusion AVANT SpatialTransform
-        transforms.append(MergeBoundaryIntoSeg(boundary_key='boundary', seg_key='seg'))
+        transforms.append(MergeBoundaryIntoSeg(boundary_key='boundary', seg_key='segmentation'))
 
         transforms.append(
             SpatialTransform(
@@ -741,7 +741,7 @@ class nnUNetTrainer(object):
         )
 
        # On SPLIT juste après SpatialTransform pour remettre seg/boundary comme attendu par la suite
-        transforms.append(SplitBoundaryFromSeg(boundary_key='boundary', seg_key='seg'))
+        transforms.append(SplitBoundaryFromSeg(boundary_key='boundary', seg_key='segmentation'))
 
         if do_dummy_2d_data_aug:
             transforms.append(Convert2DTo3DTransform())
