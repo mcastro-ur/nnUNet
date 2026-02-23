@@ -66,11 +66,7 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
-from nnunetv2.training.nnUNetTrainer.variants.loss.boundary_dataset_wrapper import BoundaryDatasetWrapper  # ? ton fichier B1
 
-from merge_boundary_into_seg import MergeBoundaryIntoSeg
-from split_boundary_from_seg import SplitBoundaryFromSeg
-# from batchgeneratorsv2.transforms.spatial.spatial import SpatialTransform
 
 
 class nnUNetTrainer(object):
@@ -627,35 +623,14 @@ class nnUNetTrainer(object):
                                        'splits.json or ignore if this is intentional.')
         return tr_keys, val_keys
 
-#    def get_tr_and_val_datasets(self):
-#        # create dataset split
-#        tr_keys, val_keys = self.do_split()
-#
-#        # load the datasets for training and validation. Note that we always draw random samples so we really don't
-#        # care about distributing training cases across GPUs.
-#        dataset_tr = self.dataset_class(self.preprocessed_dataset_folder, tr_keys,
-#                                        folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-#        dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
-#                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-#        return dataset_tr, dataset_val
-
 
     def get_tr_and_val_datasets(self):
         tr_keys, val_keys = self.do_split()
-    
-        dataset_tr = self.dataset_class(
-            self.preprocessed_dataset_folder, tr_keys,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
-        )
-        dataset_val = self.dataset_class(
-            self.preprocessed_dataset_folder, val_keys,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage
-        )
-    
-        # ?? ICI : on injecte les boundary bands pré-calculés dans chaque sample du train
-        boundary_root = "/scratch/nnUNet_raw/Dataset092_Prostate26/boundaryTr"  # ? ajuste le chemin
-        dataset_tr = BoundaryDatasetWrapper(dataset_tr, boundary_root)
-    
+
+        dataset_tr = self.dataset_class(self.preprocessed_dataset_folder, tr_keys,
+                                        folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
+        dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
+                                         folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
         return dataset_tr, dataset_val
 
     def get_dataloaders(self):
