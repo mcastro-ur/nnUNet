@@ -9,18 +9,24 @@ class nnUNetTrainerV2_BoundaryDiceCE_1500ep(nnUNetTrainerV2_BoundaryDiceCE):
 
     Schedule:
       Epochs   0..149  → w_boundary = 0.0  (warmup, Dice+CE only)
-      Epochs 150..399  → linear ramp  0.0 → 0.3
-      Epochs 400..1500 → w_boundary = 0.3  (constant)
+      Epochs 150..599  → linear ramp  0.0 → 0.2
+      Epochs 600..1500 → w_boundary = 0.2  (constant)
 
     Loss effective at full regime:
-      L = 0.5*Dice + 0.5*CE + 0.3*Boundary
+      L = 0.5*Dice + 0.5*CE + 0.2*Boundary
     """
 
-    w_boundary_max: float = 0.3
+    w_boundary_max: float = 0.2
     w_boundary_warmup_end: int = 150
-    w_boundary_ramp_end: int = 400
+    w_boundary_ramp_end: int = 600
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 1500
+        # Even more conservative LR for 1500-epoch training
+        import os
+        if not os.environ.get("NNUNET_INITIAL_LR", "").strip():
+            self.initial_lr = 5e-4
+        if not os.environ.get("NNUNET_CLIP_GRAD", "").strip():
+            self.clip_grad = 5.0
