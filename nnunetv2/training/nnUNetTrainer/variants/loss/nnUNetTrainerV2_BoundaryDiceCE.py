@@ -157,7 +157,7 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, enabled=self.use_amp) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
 
         # Compute loss in FP32 to avoid NaN/overflow in boundary term
