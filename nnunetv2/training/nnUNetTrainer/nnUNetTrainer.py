@@ -146,7 +146,8 @@ class nnUNetTrainer(object):
                 if self.is_cascaded else None
 
         ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-2
+        _env_lr = os.environ.get("NNUNET_INITIAL_LR", "").strip()
+        self.initial_lr = float(_env_lr) if _env_lr else 1e-2
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
@@ -202,8 +203,16 @@ class nnUNetTrainer(object):
         # self.configure_rotation_dummyDA_mirroring_and_inital_patch_size and will be saved in checkpoints
 
         ### checkpoint saving stuff
-        self.save_every = 50
+        _env_save = os.environ.get("NNUNET_SAVE_EVERY", "").strip()
+        self.save_every = int(_env_save) if _env_save else 50
         self.disable_checkpointing = False
+
+        ### gradient clipping
+        _env_clip = os.environ.get("NNUNET_CLIP_GRAD", "").strip()
+        self.clip_grad = float(_env_clip) if _env_clip else 12.0
+
+        ### verbose training diagnostics
+        self.verbose_train = os.environ.get("NNUNET_VERBOSE_TRAIN", "0").strip().lower() in ("1", "true", "yes")
 
         self.was_initialized = False
 
@@ -1018,14 +1027,21 @@ class nnUNetTrainer(object):
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_grad)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_grad)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+
+        if self.verbose_train and not torch.isfinite(l):
+            self.print_to_log_file(f"[verbose] NaN/Inf loss detected: {l.item()}")
+
+        ret = {'loss': l.detach().cpu().numpy()}
+        if self.verbose_train:
+            ret['grad_norm'] = float(grad_norm)
+        return ret
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1038,6 +1054,10 @@ class nnUNetTrainer(object):
             loss_here = np.mean(outputs['loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+
+        if self.verbose_train and 'grad_norm' in outputs and self.local_rank == 0:
+            avg_grad_norm = np.mean(outputs['grad_norm'])
+            self.print_to_log_file(f"  [verbose] avg_grad_norm = {avg_grad_norm:.4f}")
 
     def on_validation_epoch_start(self):
         self.network.eval()

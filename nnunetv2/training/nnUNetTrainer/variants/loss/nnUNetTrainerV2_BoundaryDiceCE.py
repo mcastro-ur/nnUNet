@@ -14,10 +14,12 @@ Boundary weight schedule (applied per-epoch, updated in on_train_epoch_start):
 Design choices (see problem statement):
   - torch.compile disabled (_do_i_compile returns False)
   - BoundaryLoss computed in FP32 even under AMP (autocast disabled locally)
-  - NaN/Inf detection: crash only on NaN/Inf, log on rank-0 only
+  - NaN/Inf detection: skip optimizer step, raise only after 3 consecutive bad steps
   - Deep supervision: boundary loss applied only to the full-resolution output
   - No modifications to plans/dataset
 """
+
+import os
 
 import numpy as np
 import torch
@@ -80,6 +82,36 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
     w_boundary_ramp_end: int = 100    # epochs warmup_end..(ramp_end-1) → linear ramp
 
     # ------------------------------------------------------------------ #
+    # Init: lower LR + tighter clip, apply env-var ramp overrides         #
+    # ------------------------------------------------------------------ #
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+        # Lower defaults for BoundaryDiceCE (more conservative than base trainer)
+        # Only override if the user has not already set via NNUNET_INITIAL_LR env var
+        if not os.environ.get("NNUNET_INITIAL_LR", "").strip():
+            self.initial_lr = 1e-3
+        if not os.environ.get("NNUNET_CLIP_GRAD", "").strip():
+            self.clip_grad = 5.0
+
+        # Apply env-var overrides for ramp schedule
+        _warmup = os.environ.get("NNUNET_BOUNDARY_WARMUP_END", "").strip()
+        if _warmup:
+            self.w_boundary_warmup_end = int(_warmup)
+
+        _ramp = os.environ.get("NNUNET_BOUNDARY_RAMP_END", "").strip()
+        if _ramp:
+            self.w_boundary_ramp_end = int(_ramp)
+
+        _bmax = os.environ.get("NNUNET_BOUNDARY_MAX", "").strip()
+        if _bmax:
+            self.w_boundary_max = float(_bmax)
+
+        # Counter for consecutive NaN/Inf steps (used for tolerance logic)
+        self._nan_step_count = 0
+
+    # ------------------------------------------------------------------ #
     # torch.compile disabled for this trainer                             #
     # ------------------------------------------------------------------ #
     def _do_i_compile(self) -> bool:
@@ -137,6 +169,25 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
         if self.local_rank == 0:
             self.print_to_log_file(f"  [BoundaryDiceCE] w_boundary = {w:.4f}")
 
+    def on_train_epoch_end(self, train_outputs):
+        """Override to use nanmean so skipped NaN steps don't corrupt epoch loss."""
+        from nnunetv2.utilities.collate_outputs import collate_outputs
+        import torch.distributed as dist
+        outputs = collate_outputs(train_outputs)
+
+        if self.is_ddp:
+            losses_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(losses_tr, outputs['loss'])
+            loss_here = np.nanmean(np.vstack(losses_tr))
+        else:
+            loss_here = np.nanmean(outputs['loss'])
+
+        self.logger.log('train_losses', loss_here, self.current_epoch)
+
+        if self.verbose_train and 'grad_norm' in outputs and self.local_rank == 0:
+            avg_grad_norm = np.nanmean(outputs['grad_norm'])
+            self.print_to_log_file(f"  [verbose] avg_grad_norm = {avg_grad_norm:.4f}")
+
     # ------------------------------------------------------------------ #
     # Training step: pass boundary to loss, compute boundary in FP32     #
     # ------------------------------------------------------------------ #
@@ -172,24 +223,39 @@ class nnUNetTrainerV2_BoundaryDiceCE(nnUNetTrainer):
 
             l = self.loss(output_fp32, target_fp32, boundary)
 
-        # NaN/Inf check: crash only, log on rank-0 only
+        # NaN/Inf tolerance: skip optimizer step, raise only after >3 consecutive bad steps
         if not torch.isfinite(l):
+            self._nan_step_count += 1
             if self.local_rank == 0:
                 self.print_to_log_file(
-                    f"WARNING: non-finite loss detected at epoch {self.current_epoch}: {l.item()}"
+                    f"WARNING: non-finite loss at epoch {self.current_epoch} "
+                    f"(consecutive={self._nan_step_count}): {l.item()}"
                 )
-            raise RuntimeError(f"Non-finite loss at epoch {self.current_epoch}: {l.item()}")
+            if self._nan_step_count > 3:
+                raise RuntimeError(
+                    f"Non-finite loss persists for {self._nan_step_count} consecutive steps "
+                    f"at epoch {self.current_epoch}: {l.item()}"
+                )
+            self.optimizer.zero_grad(set_to_none=True)
+            return {'loss': np.nan}
+
+        self._nan_step_count = 0
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
             self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_grad)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             l.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.clip_grad)
             self.optimizer.step()
 
-        return {'loss': l.detach().cpu().numpy()}
+        ret = {'loss': l.detach().cpu().numpy()}
+
+        if self.verbose_train:
+            ret['grad_norm'] = float(grad_norm)
+
+        return ret
 

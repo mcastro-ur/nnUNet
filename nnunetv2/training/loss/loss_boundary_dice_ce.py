@@ -108,7 +108,8 @@ class BoundaryDiceCELoss(nn.Module):
         logits: torch.Tensor,
         target: torch.Tensor,
         boundary: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_components: bool = False,
+    ) -> torch.Tensor | dict:
         if self.ignore_label is not None:
             assert target.shape[1] == 1
             mask = target != self.ignore_label
@@ -131,9 +132,19 @@ class BoundaryDiceCELoss(nn.Module):
         else:
             loss_boundary = torch.tensor(0.0, device=logits.device, dtype=torch.float32)
 
-        return (
+        total = (
             self.weight_dice * loss_dice
             + self.weight_ce * loss_ce
             + self.weight_boundary * loss_boundary
         )
+
+        if return_components:
+            return {
+                'total': total,
+                'dice': loss_dice if isinstance(loss_dice, torch.Tensor) else torch.tensor(loss_dice, device=logits.device, dtype=torch.float32),
+                'ce': loss_ce if isinstance(loss_ce, torch.Tensor) else torch.tensor(loss_ce, device=logits.device, dtype=torch.float32),
+                'boundary': loss_boundary,
+            }
+
+        return total
 
