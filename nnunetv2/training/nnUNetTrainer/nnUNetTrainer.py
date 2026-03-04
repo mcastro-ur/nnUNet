@@ -177,7 +177,8 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
+        self.use_amp = os.environ.get("NNUNET_USE_AMP", "0").strip().lower() in ("1", "true", "yes")
+        self.grad_scaler = GradScaler("cuda") if (self.device.type == 'cuda' and self.use_amp) else None
         self.loss = None  # -> self.initialize
 
         ### Simple logging. Don't take that away from me!
@@ -213,6 +214,8 @@ class nnUNetTrainer(object):
                                "Nature methods, 18(2), 203-211.\n"
                                "#######################################################################\n",
                                also_print_to_console=True, add_timestamp=False)
+        if self.use_amp:
+            self.print_to_log_file("AMP enabled (NNUNET_USE_AMP=1)", also_print_to_console=True, add_timestamp=False)
 
     def initialize(self):
         if not self.was_initialized:
@@ -1007,7 +1010,7 @@ class nnUNetTrainer(object):
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, enabled=self.use_amp) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             # del data
             l = self.loss(output, target)
@@ -1398,6 +1401,8 @@ class nnUNetTrainer(object):
             self.on_train_epoch_end(train_outputs)
 
             with torch.no_grad():
+                # Free cached memory before validation to reduce transient fragmentation spikes
+                torch.cuda.empty_cache()
                 self.on_validation_epoch_start()
                 val_outputs = []
                 for batch_id in range(self.num_val_iterations_per_epoch):
