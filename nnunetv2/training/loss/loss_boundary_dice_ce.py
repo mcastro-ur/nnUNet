@@ -45,7 +45,7 @@ class BoundaryLoss(nn.Module):
             bnd = self._boundary_from_target(target, num_classes=probs.shape[1])
 
         # Weighted sum: (B,) then mean
-        loss = (probs * bnd).sum(dim=list(range(1, probs.ndim))).mean()
+        loss = (probs * bnd).mean()
         return loss
 
     @staticmethod
