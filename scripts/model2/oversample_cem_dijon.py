@@ -93,7 +93,7 @@ def main():
             continue
         case_id = fname.replace("_0000.nii.gz", "")
         # Skip already-duplicated cases
-        if any(f"_dup" in case_id for _ in [None]):
+        if "_dup" in case_id:
             continue
         if any(case_id.startswith(pfx) for pfx in args.prefixes):
             cases_to_dup.append(case_id)

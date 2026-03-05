@@ -75,7 +75,7 @@ def main():
             ds = json.load(f)
         case_ids = sorted(
             os.path.basename(p).replace(".nii.gz", "").replace("_0000", "")
-            for p in ds.get("training", {})
+            for p in ds.get("training", [])
         )
 
     if not case_ids:

@@ -218,6 +218,7 @@ class nnUNetTrainerSkeletonRecall_ProstateIOU(nnUNetTrainer):
                 wait_time=0.002,
             )
 
+        # Prime the generators to pre-load the first batch into their cache
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
