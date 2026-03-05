@@ -21,7 +21,7 @@ from pathlib import Path
 
 def count_cases(image_tr_dir: Path) -> int:
     """Count total cases (originals + duplicates) in imagesTr."""
-    return len([f for f in os.listdir(image_tr_dir) if f.endswith("_0000.nii.gz")])
+    return sum(1 for f in os.listdir(image_tr_dir) if f.endswith("_0000.nii.gz"))
 
 
 def update_dataset_json(dataset_dir: Path, new_num_training: int) -> None:
