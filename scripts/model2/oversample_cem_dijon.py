@@ -14,8 +14,33 @@ Usage:
   python oversample_cem_dijon.py --dataset-dir DATASET_ROOT_DIR [--n-copies 3]
 """
 import argparse
+import json
 import os
 from pathlib import Path
+
+
+def count_cases(image_tr_dir: Path) -> int:
+    """Count total cases (originals + duplicates) in imagesTr."""
+    return len([f for f in os.listdir(image_tr_dir) if f.endswith("_0000.nii.gz")])
+
+
+def update_dataset_json(dataset_dir: Path, new_num_training: int) -> None:
+    """Update numTraining in dataset.json to match actual file count."""
+    json_path = dataset_dir / "dataset.json"
+    if not json_path.exists():
+        print(f"  WARNING: dataset.json not found at {json_path}, skipping update.")
+        return
+
+    with open(json_path, "r") as f:
+        dataset_json = json.load(f)
+
+    old_num = dataset_json.get("numTraining", "?")
+    dataset_json["numTraining"] = new_num_training
+
+    with open(json_path, "w") as f:
+        json.dump(dataset_json, f, indent=4)
+
+    print(f"Updated dataset.json: numTraining {old_num} → {new_num_training}")
 
 
 def create_symlinks_for_case(
@@ -108,6 +133,12 @@ def main():
 
     total_new = len(cases_to_dup) * args.n_copies
     print(f"Created {total_new} symlink pairs.")
+
+    # ── Update dataset.json with new total ──
+    new_total = count_cases(image_tr_dir)
+    update_dataset_json(dataset_dir, new_total)
+
+    print(f"Total cases now: {new_total}")
     print("Done.")
 
 
