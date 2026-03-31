@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -27,7 +27,13 @@ class nnUNetDataLoader(DataLoader):
                  sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
-                 transforms=None):
+                 transforms=None,
+                 # ── [AJOUT] Répertoire des dist_maps précalculées ─────────
+                 # Ex: /scratch/nnUNet_raw/Dataset092_Prostate26/
+                 #         Dataset092_Prostate26/boundaryTr
+                 # Mettre None pour désactiver (fallback boundary morphologique)
+                 dist_maps_dir: Optional[str] = None,
+                 dist_maps_suffix: str = "_boundary_small_distmaps.npy"):
         """
         If we get a 2D patch size, make it pseudo 3D and remember to remove the singleton dimension before
         returning the batch
@@ -66,6 +72,22 @@ class nnUNetDataLoader(DataLoader):
             else self._probabilistic_oversampling
         self.transforms = transforms
 
+        # ── [AJOUT] dist_maps ─────────────────────────────────────────────
+        self.dist_maps_dir = dist_maps_dir
+        self.dist_maps_suffix = dist_maps_suffix
+        # Log au démarrage pour confirmer que les dist_maps sont bien trouvées
+        if dist_maps_dir is not None:
+            if os.path.isdir(dist_maps_dir):
+                npy_files = [f for f in os.listdir(dist_maps_dir)
+                             if f.endswith(dist_maps_suffix)]
+                print(f"[DataLoader] dist_maps_dir={dist_maps_dir}")
+                print(f"[DataLoader] {len(npy_files)} fichiers *{dist_maps_suffix} trouvés")
+            else:
+                print(f"[DataLoader] ATTENTION: dist_maps_dir introuvable: {dist_maps_dir}")
+                self.dist_maps_dir = None
+        else:
+            print("[DataLoader] dist_maps_dir=None → boundary loss sans EDT (fallback morphologique)")
+
     def _oversample_last_XX_percent(self, sample_idx: int) -> bool:
         """
         determines whether sample sample_idx in a minibatch needs to be guaranteed foreground
@@ -73,7 +95,6 @@ class nnUNetDataLoader(DataLoader):
         return not sample_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
 
     def _probabilistic_oversampling(self, sample_idx: int) -> bool:
-        # print('YEAH BOIIIIII')
         return np.random.uniform() < self.oversample_foreground_percent
 
     def determine_shapes(self):
@@ -88,34 +109,47 @@ class nnUNetDataLoader(DataLoader):
         seg_shape = (self.batch_size, channels_seg, *self.patch_size)
         return data_shape, seg_shape
 
+    # ── [AJOUT] Chargement des dist_maps pour un cas ─────────────────────────
+    def _try_load_dist_maps(self, case_id: str) -> Optional[np.ndarray]:
+        """
+        Charge les distance maps précalculées pour le cas case_id.
+
+        Chemin construit : {dist_maps_dir}/{case_id}{dist_maps_suffix}
+        Ex: .../boundaryTr/case_001_boundary_small_distmaps.npy
+
+        Retourne un array float32 (C, H, W, D) ou None si non disponible.
+        """
+        if self.dist_maps_dir is None:
+            return None
+        dist_path = os.path.join(self.dist_maps_dir,
+                                 case_id + self.dist_maps_suffix)
+        if os.path.exists(dist_path):
+            # mmap_mode='r' : numpy accède le fichier comme une vue mémoire
+            # → seul le patch croppé est réellement lu depuis le disque
+            # → évite de charger 462 MB en RAM par worker à chaque batch
+            arr = np.load(dist_path, allow_pickle=False, mmap_mode='r')
+            # Copie explicite float32 APRÈS le crop (fait dans generate_train_batch)
+            return arr  # dtype float16 conservé, conversion après crop
+        return None
+
     def get_bbox(self, data_shape: np.ndarray, force_fg: bool, class_locations: Union[dict, None],
                  overwrite_class: Union[int, Tuple[int, ...]] = None, verbose: bool = False):
-        # in dataloader 2d we need to select the slice prior to this and also modify the class_locations to only have
-        # locations for the given slice
         need_to_pad = self.need_to_pad.copy()
         dim = len(data_shape)
 
         for d in range(dim):
-            # if case_all_data.shape + need_to_pad is still < patch size we need to pad more! We pad on both sides
-            # always
             if need_to_pad[d] + data_shape[d] < self.patch_size[d]:
                 need_to_pad[d] = self.patch_size[d] - data_shape[d]
 
-        # we can now choose the bbox from -need_to_pad // 2 to shape - patch_size + need_to_pad // 2. Here we
-        # define what the upper and lower bound can be to then sample form them with np.random.randint
         lbs = [- need_to_pad[i] // 2 for i in range(dim)]
         ubs = [data_shape[i] + need_to_pad[i] // 2 + need_to_pad[i] % 2 - self.patch_size[i] for i in range(dim)]
 
-        # if not force_fg then we can just sample the bbox randomly from lb and ub. Else we need to make sure we get
-        # at least one of the foreground classes in the patch
         if not force_fg and not self.has_ignore:
             bbox_lbs = [np.random.randint(lbs[i], ubs[i] + 1) for i in range(dim)]
-            # print('I want a random location')
         else:
             if not force_fg and self.has_ignore:
                 selected_class = self.annotated_classes_key
                 if len(class_locations[selected_class]) == 0:
-                    # no annotated pixels in this case. Not good. But we can hardly skip it here
                     warnings.warn('Warning! No annotated pixels in image!')
                     selected_class = None
             elif force_fg:
@@ -123,45 +157,31 @@ class nnUNetDataLoader(DataLoader):
                 if overwrite_class is not None:
                     assert overwrite_class in class_locations.keys(), 'desired class ("overwrite_class") does not ' \
                                                                       'have class_locations (missing key)'
-                # this saves us a np.unique. Preprocessing already did that for all cases. Neat.
-                # class_locations keys can also be tuple
                 eligible_classes_or_regions = [i for i in class_locations.keys() if len(class_locations[i]) > 0]
 
-                # if we have annotated_classes_key locations and other classes are present, remove the annotated_classes_key from the list
-                # strange formulation needed to circumvent
-                # ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
                 tmp = [i == self.annotated_classes_key if isinstance(i, tuple) else False for i in eligible_classes_or_regions]
                 if any(tmp):
                     if len(eligible_classes_or_regions) > 1:
                         eligible_classes_or_regions.pop(np.where(tmp)[0][0])
 
                 if len(eligible_classes_or_regions) == 0:
-                    # this only happens if some image does not contain foreground voxels at all
                     selected_class = None
                     if verbose:
                         print('case does not contain any foreground classes')
                 else:
-                    # I hate myself. Future me aint gonna be happy to read this
-                    # 2022_11_25: had to read it today. Wasn't too bad
                     selected_class = eligible_classes_or_regions[np.random.choice(len(eligible_classes_or_regions))] if \
                         (overwrite_class is None or (overwrite_class not in eligible_classes_or_regions)) else overwrite_class
-                # print(f'I want to have foreground, selected class: {selected_class}')
             else:
                 raise RuntimeError('lol what!?')
 
             if selected_class is not None:
                 voxels_of_that_class = class_locations[selected_class]
                 selected_voxel = voxels_of_that_class[np.random.choice(len(voxels_of_that_class))]
-                # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
-                # Make sure it is within the bounds of lb and ub
-                # i + 1 because we have first dimension 0!
                 bbox_lbs = [max(lbs[i], selected_voxel[i + 1] - self.patch_size[i] // 2) for i in range(dim)]
             else:
-                # If the image does not contain any foreground classes, we fall back to random cropping
                 bbox_lbs = [np.random.randint(lbs[i], ubs[i] + 1) for i in range(dim)]
 
         bbox_ubs = [bbox_lbs[i] + self.patch_size[i] for i in range(dim)]
-
         return bbox_lbs, bbox_ubs
 
     def generate_train_batch(self):
@@ -170,27 +190,36 @@ class nnUNetDataLoader(DataLoader):
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
 
+        # ── [AJOUT] Accumulation des dist_maps pour le batch ─────────────────
+        dist_maps_list = []   # rempli au fil du for loop ci-dessous
+        # ──────────────────────────────────────────────────────────────────────
+
         for j, i in enumerate(selected_keys):
-            # oversampling foreground will improve stability of model training, especially if many patches are empty
-            # (Lung for example)
             force_fg = self.get_do_oversample(j)
 
             data, seg, seg_prev, properties = self._data.load_case(i)
 
-            # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
-            # self._data.load_case(i) (see nnUNetDataset.load_case)
             shape = data.shape[1:]
-
             bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
-            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+            bbox = [[a, b] for a, b in zip(bbox_lbs, bbox_ubs)]
 
-            # use ACVL utils for that. Cleaner.
             data_all[j] = crop_and_pad_nd(data, bbox, 0)
 
             seg_cropped = crop_and_pad_nd(seg, bbox, -1)
             if seg_prev is not None:
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
             seg_all[j] = seg_cropped
+
+            # ── [AJOUT] Chargement + crop des dist_maps pour ce cas ─────
+            # dist_maps sont sauvegardées à pleine résolution (C, H, W, D)
+            # → doit être croppé avec le MÊME bbox que data et seg
+            dm = self._try_load_dist_maps(i)
+            if dm is not None:
+                # dm shape : (C, H, W, D) — crop spatial avec bbox identique
+                dm_cropped = crop_and_pad_nd(dm, bbox, 0)  # pad_value=0 (hors champ)
+                # Conversion float32 ici — après crop, pas sur le volume entier
+                dist_maps_list.append(np.array(dm_cropped, dtype=np.float32))
+            # ──────────────────────────────────────────────────────────────
 
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
@@ -213,14 +242,28 @@ class nnUNetDataLoader(DataLoader):
                     else:
                         seg_all = torch.stack(segs)
                     del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+            # ── [AJOUT] Ajout des dist_maps dans le batch retourné ────────
+            batch = {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+            if len(dist_maps_list) == self.batch_size:
+                # Tous les cas ont leurs dist_maps → on les passe au trainer
+                batch['dist_maps'] = torch.from_numpy(
+                    np.stack(dist_maps_list, axis=0)   # (B, C, H, W, D)
+                )
+            return batch
+
+        # ── [AJOUT] Même chose pour le return sans transforms ────────────────
+        batch = {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+        if len(dist_maps_list) == self.batch_size:
+            batch['dist_maps'] = torch.from_numpy(
+                np.stack(dist_maps_list, axis=0)   # (B, C, H, W, D)
+            )
+        return batch
 
 
 if __name__ == '__main__':
     folder = join(nnUNet_preprocessed, 'Dataset002_Heart', 'nnUNetPlans_3d_fullres')
-    ds = nnUNetDatasetBlosc2(folder)  # this should not load the properties!
+    ds = nnUNetDatasetBlosc2(folder)
     pm = PlansManager(join(folder, os.pardir, 'nnUNetPlans.json'))
     lm = pm.get_label_manager(load_json(join(folder, os.pardir, 'dataset.json')))
     dl = nnUNetDataLoader(ds, 5, (16, 16, 16), (16, 16, 16), lm,
